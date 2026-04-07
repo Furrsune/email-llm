@@ -20,7 +20,8 @@ async def supabase_request(method: str, path: str, json_data: dict = None):
     headers = {
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"   # <-- ДОБАВИТЬ ЭТУ СТРОКУ
     }
     async with httpx.AsyncClient(proxy=os.getenv("HTTP_PROXY"), timeout=30.0) as client:
         if method == "GET":
@@ -30,6 +31,9 @@ async def supabase_request(method: str, path: str, json_data: dict = None):
         else:
             raise ValueError("Unsupported method")
         resp.raise_for_status()
+        # Если ответ всё ещё пустой — вернуть пустой список
+        if not resp.content:
+            return []
         return resp.json()
 
 class LetterCreate(BaseModel):
@@ -123,7 +127,13 @@ async def reply_to_letter(letter_id: int, req: ReplyRequest):
         "created_at": datetime.utcnow().isoformat()
     }
     result = await supabase_request("POST", "letters", json_data=new_letter)
-    created = result[0] if isinstance(result, list) else result
+    # result теперь должен быть списком из одного элемента
+    if isinstance(result, list) and len(result) > 0:
+        created = result[0]
+    elif isinstance(result, dict):
+        created = result
+    else:
+        raise HTTPException(500, "Failed to create letter: empty response")
     return LetterOut(**created)
 
 handler = Mangum(app)
