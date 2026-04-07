@@ -1,36 +1,37 @@
 import os
-import json
 import httpx
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 from mangum import Mangum
 
-# --- Database setup (asyncpg + SQLAlchemy core) ---
-import sqlalchemy
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import Table, Column, Integer, String, Text, DateTime, MetaData, select, insert
+app = FastAPI(title="Email LLM Service")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").replace("postgresql://", "postgresql+asyncpg://")
-engine = create_async_engine(DATABASE_URL)
-async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_ANON_KEY must be set")
 
-metadata = MetaData()
-letters_table = Table(
-    "letters",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    Column("thread_id", Integer),
-    Column("sender", String),
-    Column("subject", String),
-    Column("body", Text),
-    Column("created_at", DateTime),
-)
+async def supabase_request(method: str, path: str, json_data: dict = None):
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json"
+    }
+    async with httpx.AsyncClient(proxy=os.getenv("HTTP_PROXY"), timeout=30.0) as client:
+        if method == "GET":
+            resp = await client.get(url, headers=headers)
+        elif method == "POST":
+            resp = await client.post(url, headers=headers, json=json_data)
+        else:
+            raise ValueError("Unsupported method")
+        resp.raise_for_status()
+        return resp.json()
 
-# --- Pydantic models ---
 class LetterCreate(BaseModel):
     thread_id: Optional[int] = None
     sender: str
@@ -49,133 +50,80 @@ class ReplyRequest(BaseModel):
     message: str
     provider: str
 
-# --- FastAPI app ---
-app = FastAPI(title="Email LLM Service")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# --- Helper: get proxy settings ---
-PROXY_URL = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
-def get_httpx_client():
-    return httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None, timeout=30.0)
-
-# --- LLM calls through proxy ---
 async def call_together(prompt: str, api_key: str) -> str:
     url = "https://api.together.xyz/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
-        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",  # Можно заменить на любую бесплатную модель Together
+        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         "messages": [{"role": "user", "content": prompt}],
     }
-    async with get_httpx_client() as client:
-        response = await client.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+    async with httpx.AsyncClient(proxy=os.getenv("HTTP_PROXY"), timeout=30.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
-# --- API endpoints ---
 @app.post("/api/letters", response_model=LetterOut)
 async def create_letter(letter: LetterCreate):
-    """Создать новое письмо (начало цепочки)."""
-    async with async_session() as session:
-        # Если thread_id не указан, создаём новый
-        if letter.thread_id is None:
-            # Определяем следующий thread_id (максимальный + 1)
-            result = await session.execute(select(sqlalchemy.func.max(letters_table.c.thread_id)))
-            max_id = result.scalar() or 0
-            thread_id = max_id + 1
-        else:
-            thread_id = letter.thread_id
-
-        ins = letters_table.insert().values(
-            thread_id=thread_id,
-            sender=letter.sender,
-            subject=letter.subject,
-            body=letter.body,
-            created_at=datetime.utcnow()
-        )
-        new_id = await session.execute(ins)
-        await session.commit()
-        # Получить созданную запись
-        result = await session.execute(select(letters_table).where(letters_table.c.id == new_id.inserted_primary_key[0]))
-        row = result.first()
-        return LetterOut(**row._asdict())
+    if letter.thread_id is None:
+        result = await supabase_request("GET", "letters?select=thread_id&order=thread_id.desc&limit=1")
+        max_id = result[0]["thread_id"] if result else 0
+        thread_id = max_id + 1
+    else:
+        thread_id = letter.thread_id
+    new_letter = {
+        "thread_id": thread_id,
+        "sender": letter.sender,
+        "subject": letter.subject,
+        "body": letter.body,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    result = await supabase_request("POST", "letters", json_data=new_letter)
+    created = result[0] if isinstance(result, list) else result
+    return LetterOut(**created)
 
 @app.get("/api/letters", response_model=List[LetterOut])
 async def list_letters():
-    """Получить все письма, отсортированные по убыванию даты."""
-    async with async_session() as session:
-        result = await session.execute(select(letters_table).order_by(letters_table.c.created_at.desc()))
-        rows = result.fetchall()
-        return [LetterOut(**row._asdict()) for row in rows]
+    result = await supabase_request("GET", "letters?order=created_at.desc")
+    return [LetterOut(**item) for item in result]
 
 @app.get("/api/threads/{thread_id}", response_model=List[LetterOut])
 async def get_thread(thread_id: int):
-    """Получить всю цепочку писем по thread_id (сортировка по возрастанию времени)."""
-    async with async_session() as session:
-        result = await session.execute(
-            select(letters_table)
-            .where(letters_table.c.thread_id == thread_id)
-            .order_by(letters_table.c.created_at.asc())
-        )
-        rows = result.fetchall()
-        if not rows:
-            raise HTTPException(404, "Thread not found")
-        return [LetterOut(**row._asdict()) for row in rows]
+    result = await supabase_request("GET", f"letters?thread_id=eq.{thread_id}&order=created_at.asc")
+    if not result:
+        raise HTTPException(404, "Thread not found")
+    return [LetterOut(**item) for item in result]
 
 @app.post("/api/letters/{letter_id}/reply")
 async def reply_to_letter(letter_id: int, req: ReplyRequest):
-    """Ответить на письмо: сгенерировать ответ через LLM и сохранить как новое письмо."""
-    async with async_session() as session:
-        # Получить исходное письмо
-        result = await session.execute(select(letters_table).where(letters_table.c.id == letter_id))
-        original = result.first()
-        if not original:
-            raise HTTPException(404, "Letter not found")
-
-        thread_id = original.thread_id
-        # Получить всю историю переписки для контекста
-        hist_result = await session.execute(
-            select(letters_table).where(letters_table.c.thread_id == thread_id).order_by(letters_table.c.created_at.asc())
-        )
-        history = hist_result.fetchall()
-
-        # Формируем prompt
-        context = ""
-        for h in history:
-            context += f"From: {h.sender}\nSubject: {h.subject}\n{h.body}\n\n"
-        context += f"From: User\nSubject: Re: {original.subject}\n{req.message}\n\n"
-        prompt = f"""Ты — помощник в почтовом клиенте. Ответь на письмо в формате обычного email.
-Используй тему, начинающуюся с "Re: {original.subject}".
+    letters = await supabase_request("GET", f"letters?id=eq.{letter_id}")
+    if not letters:
+        raise HTTPException(404, "Letter not found")
+    original = letters[0]
+    thread_id = original["thread_id"]
+    thread = await supabase_request("GET", f"letters?thread_id=eq.{thread_id}&order=created_at.asc")
+    context = ""
+    for h in thread:
+        context += f"From: {h['sender']}\nSubject: {h['subject']}\n{h['body']}\n\n"
+    context += f"From: User\nSubject: Re: {original['subject']}\n{req.message}\n\n"
+    prompt = f"""Ты — помощник в почтовом клиенте. Ответь на письмо в формате обычного email.
+Используй тему, начинающуюся с "Re: {original['subject']}".
 Твой ответ должен содержать только текст письма (без служебных полей, просто тело письма).
 Контекст переписки:
 {context}
 Твой ответ:"""
+    api_key = os.getenv("TOGETHER_API_KEY")
+    if not api_key:
+        raise HTTPException(500, "TOGETHER_API_KEY not set")
+    reply_body = await call_together(prompt, api_key)
+    new_letter = {
+        "thread_id": thread_id,
+        "sender": "AI Assistant",
+        "subject": f"Re: {original['subject']}",
+        "body": reply_body.strip(),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    result = await supabase_request("POST", "letters", json_data=new_letter)
+    created = result[0] if isinstance(result, list) else result
+    return LetterOut(**created)
 
-                # Вызов Together AI через прокси
-        api_key = os.getenv("TOGETHER_API_KEY")
-        if not api_key:
-            raise HTTPException(500, "TOGETHER_API_KEY not set")
-        reply_body = await call_together(prompt, api_key)
-
-        # Сохранить ответ как новое письмо
-        new_subject = f"Re: {original.subject}"
-        ins = letters_table.insert().values(
-            thread_id=thread_id,
-            sender="AI Assistant",
-            subject=new_subject,
-            body=reply_body.strip(),
-            created_at=datetime.utcnow()
-        )
-        new_id = await session.execute(ins)
-        await session.commit()
-
-        # Вернуть созданное письмо
-        result = await session.execute(select(letters_table).where(letters_table.c.id == new_id.inserted_primary_key[0]))
-        new_letter = result.first()
-        return LetterOut(**new_letter._asdict())
-
-# --- Vercel handler ---
 handler = Mangum(app)
