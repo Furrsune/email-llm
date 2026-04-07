@@ -47,7 +47,7 @@ class LetterOut(BaseModel):
 
 class ReplyRequest(BaseModel):
     message: str
-    provider: str  # "gemini" or "chatgpt"
+    provider: str
 
 # --- FastAPI app ---
 app = FastAPI(title="Email LLM Service")
@@ -59,23 +59,20 @@ def get_httpx_client():
     return httpx.AsyncClient(proxy=PROXY_URL if PROXY_URL else None, timeout=30.0)
 
 # --- LLM calls through proxy ---
-async def call_gemini(prompt: str, api_key: str) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}"
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+async def call_together(prompt: str, api_key: str) -> str:
+    url = "https://api.together.xyz/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",  # Можно заменить на любую бесплатную модель Together
+        "messages": [{"role": "user", "content": prompt}],
+    }
     async with get_httpx_client() as client:
-        resp = await client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-
-async def call_chatgpt(prompt: str, api_key: str) -> str:
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    payload = {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": prompt}]}
-    async with get_httpx_client() as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        response = await client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
         return data["choices"][0]["message"]["content"]
 
 # --- API endpoints ---
@@ -157,20 +154,11 @@ async def reply_to_letter(letter_id: int, req: ReplyRequest):
 {context}
 Твой ответ:"""
 
-        # Вызов LLM через прокси
-        api_key = None
-        if req.provider == "gemini":
-            api_key = os.getenv("GEMINI_API_KEY")
-            if not api_key:
-                raise HTTPException(500, "GEMINI_API_KEY not set")
-            reply_body = await call_gemini(prompt, api_key)
-        elif req.provider == "chatgpt":
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                raise HTTPException(500, "OPENAI_API_KEY not set")
-            reply_body = await call_chatgpt(prompt, api_key)
-        else:
-            raise HTTPException(400, "provider must be 'gemini' or 'chatgpt'")
+                # Вызов Together AI через прокси
+        api_key = os.getenv("TOGETHER_API_KEY")
+        if not api_key:
+            raise HTTPException(500, "TOGETHER_API_KEY not set")
+        reply_body = await call_together(prompt, api_key)
 
         # Сохранить ответ как новое письмо
         new_subject = f"Re: {original.subject}"
