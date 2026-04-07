@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email LLM Client</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="app">
+        <div class="sidebar">
+            <h2>Письма</h2>
+            <button id="newLetterBtn">✏️ Новое письмо</button>
+            <ul id="letterList"></ul>
+        </div>
+        <div class="main">
+            <div id="threadView"></div>
+        </div>
+    </div>
+    <div id="newLetterModal" class="modal hidden">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h3>Новое письмо</h3>
+            <input type="text" id="newSender" placeholder="Отправитель (вы)" value="User">
+            <input type="text" id="newSubject" placeholder="Тема">
+            <textarea id="newBody" placeholder="Текст письма"></textarea>
+            <button id="sendNewLetter">Отправить</button>
+        </div>
+    </div>
+    <div id="replyModal" class="modal hidden">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h3>Ответить</h3>
+            <textarea id="replyMessage" placeholder="Ваш ответ..."></textarea>
+            <select id="replyProvider">
+                <option value="gemini">Gemini</option>
+                <option value="chatgpt">ChatGPT</option>
+            </select>
+            <button id="sendReply">Отправить и получить ответ AI</button>
+        </div>
+    </div>
+    <script src="/script.js"></script>
+</body>
+</html>
