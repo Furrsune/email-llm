@@ -3,4 +3,3 @@ mangum
 httpx
 python-dotenv
 pydantic
-openai

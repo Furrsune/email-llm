@@ -6,7 +6,6 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 from mangum import Mangum
-from openai import AsyncOpenAI
 
 app = FastAPI(title="Email LLM Service")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -54,29 +53,33 @@ class ReplyRequest(BaseModel):
     message: str
     provider: str
 
-async def call_deepseek(prompt: str, api_key: str) -> str:
+# --- YandexGPT API call ---
+async def call_yandexgpt(prompt: str, api_key: str, folder_id: str) -> str:
     """
-    Отправляет запрос к DeepSeek API и возвращает ответ.
+    Отправляет запрос к YandexGPT API и возвращает ответ.
     """
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url="https://api.deepseek.com/v1",
-    )
-
-    try:
-        response = await client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "You are a helpful email assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=1000,
-            temperature=0.7,
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"Ошибка при вызове DeepSeek API: {e}")
-        raise HTTPException(status_code=500, detail=f"DeepSeek API error: {str(e)}")
+    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+    headers = {
+        "Authorization": f"Api-Key {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "modelUri": f"gpt://{folder_id}/yandexgpt-lite",
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.7,
+            "maxTokens": 1000
+        },
+        "messages": [
+            {"role": "system", "text": "You are a helpful email assistant."},
+            {"role": "user", "text": prompt}
+        ]
+    }
+    async with httpx.AsyncClient(proxy=os.getenv("HTTP_PROXY"), timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data["result"]["alternatives"][0]["message"]["text"]
 
 @app.post("/api/letters", response_model=LetterOut)
 async def create_letter(letter: LetterCreate):
@@ -127,11 +130,12 @@ async def reply_to_letter(letter_id: int, req: ReplyRequest):
 Контекст переписки:
 {context}
 Твой ответ:"""
-    # --- Используем DeepSeek вместо Together AI ---
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise HTTPException(500, "DEEPSEEK_API_KEY environment variable not set")
-    reply_body = await call_deepseek(prompt, api_key)
+    # --- Используем YandexGPT ---
+    api_key = os.getenv("YANDEX_API_KEY")
+    folder_id = os.getenv("YANDEX_FOLDER_ID")
+    if not api_key or not folder_id:
+        raise HTTPException(500, "YANDEX_API_KEY or YANDEX_FOLDER_ID not set")
+    reply_body = await call_yandexgpt(prompt, api_key, folder_id)
     new_letter = {
         "thread_id": thread_id,
         "sender": "AI Assistant",
