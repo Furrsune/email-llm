@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 from mangum import Mangum
+from openai import AsyncOpenAI
 
 app = FastAPI(title="Email LLM Service")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -21,7 +22,7 @@ async def supabase_request(method: str, path: str, json_data: dict = None):
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation"   # <-- ДОБАВИТЬ ЭТУ СТРОКУ
+        "Prefer": "return=representation"
     }
     async with httpx.AsyncClient(proxy=os.getenv("HTTP_PROXY"), timeout=30.0) as client:
         if method == "GET":
@@ -31,7 +32,6 @@ async def supabase_request(method: str, path: str, json_data: dict = None):
         else:
             raise ValueError("Unsupported method")
         resp.raise_for_status()
-        # Если ответ всё ещё пустой — вернуть пустой список
         if not resp.content:
             return []
         return resp.json()
@@ -54,17 +54,29 @@ class ReplyRequest(BaseModel):
     message: str
     provider: str
 
-async def call_together(prompt: str, api_key: str) -> str:
-    url = "https://api.together.xyz/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    async with httpx.AsyncClient(proxy=os.getenv("HTTP_PROXY"), timeout=30.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+async def call_deepseek(prompt: str, api_key: str) -> str:
+    """
+    Отправляет запрос к DeepSeek API и возвращает ответ.
+    """
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com/v1",
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "You are a helpful email assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.7,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Ошибка при вызове DeepSeek API: {e}")
+        raise HTTPException(status_code=500, detail=f"DeepSeek API error: {str(e)}")
 
 @app.post("/api/letters", response_model=LetterOut)
 async def create_letter(letter: LetterCreate):
@@ -115,10 +127,11 @@ async def reply_to_letter(letter_id: int, req: ReplyRequest):
 Контекст переписки:
 {context}
 Твой ответ:"""
-    api_key = os.getenv("TOGETHER_API_KEY")
+    # --- Используем DeepSeek вместо Together AI ---
+    api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
-        raise HTTPException(500, "TOGETHER_API_KEY not set")
-    reply_body = await call_together(prompt, api_key)
+        raise HTTPException(500, "DEEPSEEK_API_KEY environment variable not set")
+    reply_body = await call_deepseek(prompt, api_key)
     new_letter = {
         "thread_id": thread_id,
         "sender": "AI Assistant",
@@ -127,7 +140,6 @@ async def reply_to_letter(letter_id: int, req: ReplyRequest):
         "created_at": datetime.utcnow().isoformat()
     }
     result = await supabase_request("POST", "letters", json_data=new_letter)
-    # result теперь должен быть списком из одного элемента
     if isinstance(result, list) and len(result) > 0:
         created = result[0]
     elif isinstance(result, dict):
